@@ -11,6 +11,8 @@ import (
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/gologger/levels"
+	"github.com/projectdiscovery/utils/auth/pdcp"
+	"github.com/projectdiscovery/utils/env"
 	fileutil "github.com/projectdiscovery/utils/file"
 	updateutils "github.com/projectdiscovery/utils/update"
 )
@@ -18,6 +20,8 @@ import (
 const (
 	DefaultResumeFile = "resume.cfg"
 )
+
+var PDCPApiKey string
 
 type Options struct {
 	Resolvers          string
@@ -33,6 +37,7 @@ type Options struct {
 	Silent             bool
 	Verbose            bool
 	Version            bool
+	NoColor            bool
 	Response           bool
 	ResponseOnly       bool
 	A                  bool
@@ -61,10 +66,13 @@ type Options struct {
 	HostsFile          bool
 	Stream             bool
 	CAA                bool
+	QueryAll           bool
+	ExcludeType        []string
 	OutputCDN          bool
 	ASN                bool
 	HealthCheck        bool
 	DisableUpdateCheck bool
+	PdcpAuth           string
 }
 
 // ShouldLoadResume resume file
@@ -89,6 +97,22 @@ func ParseOptions() *Options {
 		flagSet.StringVarP(&options.WordList, "wordlist", "w", "", "list of words to bruteforce (file or comma separated or stdin)"),
 	)
 
+	queries := goflags.AllowdTypes{
+		"none":  goflags.EnumVariable(0),
+		"a":     goflags.EnumVariable(1),
+		"aaaa":  goflags.EnumVariable(2),
+		"cname": goflags.EnumVariable(3),
+		"ns":    goflags.EnumVariable(4),
+		"txt":   goflags.EnumVariable(5),
+		"srv":   goflags.EnumVariable(6),
+		"ptr":   goflags.EnumVariable(7),
+		"mx":    goflags.EnumVariable(8),
+		"soa":   goflags.EnumVariable(9),
+		"axfr":  goflags.EnumVariable(10),
+		"caa":   goflags.EnumVariable(11),
+		"any":   goflags.EnumVariable(12),
+	}
+
 	flagSet.CreateGroup("query", "Query",
 		flagSet.BoolVar(&options.A, "a", false, "query A record (default)"),
 		flagSet.BoolVar(&options.AAAA, "aaaa", false, "query AAAA record"),
@@ -102,6 +126,8 @@ func ParseOptions() *Options {
 		flagSet.BoolVar(&options.ANY, "any", false, "query ANY record"),
 		flagSet.BoolVar(&options.AXFR, "axfr", false, "query AXFR"),
 		flagSet.BoolVar(&options.CAA, "caa", false, "query CAA record"),
+		flagSet.BoolVar(&options.QueryAll, "recon", false, "query all the dns records (a,aaaa,cname,ns,txt,srv,ptr,mx,soa,axfr,caa)"),
+		flagSet.EnumSliceVarP(&options.ExcludeType, "exclude-type", "e", []goflags.EnumVariable{0}, "dns query type to exclude (a,aaaa,cname,ns,txt,srv,ptr,mx,soa,axfr,caa)", queries),
 	)
 
 	flagSet.CreateGroup("filter", "Filter",
@@ -138,6 +164,7 @@ func ParseOptions() *Options {
 		flagSet.BoolVarP(&options.Raw, "debug", "raw", false, "display raw dns response"),
 		flagSet.BoolVar(&options.ShowStatistics, "stats", false, "display stats of the running scan"),
 		flagSet.BoolVar(&options.Version, "version", false, "display version of dnsx"),
+		flagSet.BoolVarP(&options.NoColor, "no-color", "nc", false, "disable color in output"),
 	)
 
 	flagSet.CreateGroup("optimization", "Optimization",
@@ -150,6 +177,7 @@ func ParseOptions() *Options {
 	)
 
 	flagSet.CreateGroup("configs", "Configurations",
+		flagSet.DynamicVar(&options.PdcpAuth, "auth", "true", "configure projectdiscovery cloud (pdcp) api key"),
 		flagSet.StringVarP(&options.Resolvers, "resolver", "r", "", "list of resolvers to use (file or comma separated)"),
 		flagSet.IntVarP(&options.WildcardThreshold, "wildcard-threshold", "wt", 5, "wildcard filter threshold"),
 		flagSet.StringVarP(&options.WildcardDomain, "wildcard-domain", "wd", "", "domain name for wildcard filtering (other flags will be ignored - only json output is supported)"),
@@ -162,6 +190,8 @@ func ParseOptions() *Options {
 		os.Exit(0)
 	}
 
+	options.configureQueryOptions()
+
 	// Read the inputs and configure the logging
 	options.configureOutput()
 
@@ -173,6 +203,20 @@ func ParseOptions() *Options {
 	err = options.configureResume()
 	if err != nil {
 		gologger.Fatal().Msgf("%s\n", err)
+	}
+
+	// api key hierarchy: cli flag > env var > .pdcp/credential file
+	if options.PdcpAuth == "true" {
+		AuthWithPDCP()
+	} else if len(options.PdcpAuth) == 36 {
+		PDCPApiKey = options.PdcpAuth
+		ph := pdcp.PDCPCredHandler{}
+		if _, err := ph.GetCreds(); err == pdcp.ErrNoCreds {
+			apiServer := env.GetEnvOrDefault("PDCP_API_SERVER", pdcp.DefaultApiServer)
+			if validatedCreds, err := ph.ValidateAPIKey(PDCPApiKey, apiServer, "dnsx"); err == nil {
+				_ = ph.SaveCreds(validatedCreds)
+			}
+		}
 	}
 
 	showBanner()
@@ -338,4 +382,37 @@ func (options *Options) configureResume() error {
 
 	}
 	return nil
+}
+
+func (options *Options) configureQueryOptions() {
+	queryMap := map[string]*bool{
+		"a":     &options.A,
+		"aaaa":  &options.AAAA,
+		"cname": &options.CNAME,
+		"ns":    &options.NS,
+		"txt":   &options.TXT,
+		"srv":   &options.SRV,
+		"ptr":   &options.PTR,
+		"mx":    &options.MX,
+		"soa":   &options.SOA,
+		"axfr":  &options.AXFR,
+		"caa":   &options.CAA,
+		"any":   &options.ANY,
+	}
+
+	if options.QueryAll {
+		for _, val := range queryMap {
+			*val = true
+		}
+		options.Response = true
+		// the ANY query type is not supported by the retryabledns library,
+		// thus it's hard to filter the results when it's used in combination with other query types
+		options.ExcludeType = append(options.ExcludeType, "any")
+	}
+
+	for _, et := range options.ExcludeType {
+		if val, ok := queryMap[et]; ok {
+			*val = false
+		}
+	}
 }

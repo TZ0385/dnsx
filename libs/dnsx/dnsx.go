@@ -10,6 +10,7 @@ import (
 	"github.com/projectdiscovery/cdncheck"
 	retryabledns "github.com/projectdiscovery/retryabledns"
 	iputil "github.com/projectdiscovery/utils/ip"
+	sliceutil "github.com/projectdiscovery/utils/slice"
 )
 
 // DNSX is structure to perform dns lookups
@@ -28,6 +29,7 @@ type Options struct {
 	TraceMaxRecursion int
 	Hostsfile         bool
 	OutputCDN         bool
+	QueryAll          bool
 }
 
 // ResponseData to show output result
@@ -76,10 +78,14 @@ var DefaultOptions = Options{
 
 // DefaultResolvers contains the list of resolvers known to be trusted.
 var DefaultResolvers = []string{
-	"udp:1.1.1.1:53", // Cloudflare
-	"udp:1.0.0.1:53", // Cloudflare
-	"udp:8.8.8.8:53", // Google
-	"udp:8.8.4.4:53", // Google
+	"udp:1.1.1.1:53",         // Cloudflare
+	"udp:1.0.0.1:53",         // Cloudflare
+	"udp:8.8.8.8:53",         // Google
+	"udp:8.8.4.4:53",         // Google
+	"udp:9.9.9.9:53",         // Quad9
+	"udp:149.112.112.112:53", // Quad9
+	"udp:208.67.222.222:53",  // Open DNS
+	"udp:208.67.220.220:53",  // Open DNS
 }
 
 // New creates a dns resolver
@@ -127,7 +133,17 @@ func (d *DNSX) QueryOne(hostname string) (*retryabledns.DNSData, error) {
 
 // QueryMultiple performs a DNS question of the specified types and returns raw responses
 func (d *DNSX) QueryMultiple(hostname string) (*retryabledns.DNSData, error) {
-	return d.dnsClient.QueryMultiple(hostname, d.Options.QuestionTypes)
+	// Omit PTR queries unless the input is an IP address to decrease execution time, as PTR queries can lead to timeouts.
+	filteredQuestionTypes := d.Options.QuestionTypes
+	if d.Options.QueryAll {
+		isIP := iputil.IsIP(hostname)
+		if !isIP {
+			filteredQuestionTypes = sliceutil.PruneEqual(filteredQuestionTypes, miekgdns.TypePTR)
+		} else {
+			filteredQuestionTypes = []uint16{miekgdns.TypePTR}
+		}
+	}
+	return d.dnsClient.QueryMultiple(hostname, filteredQuestionTypes)
 }
 
 // Trace performs a DNS trace of the specified types and returns raw responses
